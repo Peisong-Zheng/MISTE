@@ -77,126 +77,167 @@ def compute_gap_scales(
     return L_values*2 # multiplied by 2 according to Nyquist criterion
 
 
-
-
-
-
-from scipy.interpolate import interp1d   # you already have this import
+# ------------------------------------------------------------
+# 2. Gaussian kernel smoothing at scale L
+# ------------------------------------------------------------
+# import interpolate
+from scipy.interpolate import interp1d
 
 def smooth_gaussian_irregular(
     t_obs: np.ndarray,
     v_obs: np.ndarray,
-    grid: np.ndarray = None,
-    L: float = None,
-    window_half_width_factor: float = 0.25,  # half-width = 0.5 * L = L/2 (default)
-    sigma_factor: float = 1/3,              # 3σ = half-width by default
-    if_plot_smoothed: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
+    grid: np.ndarray,
+    L: float,
+    window_half_width_factor: float = 0.5,
+    sigma_factor: float = 1/3,
+    weight_threshold: float = 1e-6,
+) -> np.ndarray:
     """
-    Two-step smoothing for irregular data:
+    Gaussian kernel smoothing for irregularly sampled data.
 
-    1) Interpolate irregular observations onto a dense, uniform grid.
-    2) Apply 1-D Gaussian convolution on that grid.
+    For each grid time τ, we:
+      - Only use observations with |t_obs - τ| <= window_half_width_factor * L
+      - Within that window, apply Gaussian weights with
+            σ = (window_half_width_factor * L) * sigma_factor
+        By default, 3σ = L/2 so the effective window half-width is L/2.
 
-    The green spans (where original gaps <= L/2) can still be used
-    downstream to select 'good' regions; this function itself no
-    longer creates NaNs based on gap size.
+    This implements the idea that the smoothing window should be ≤ L/2,
+    so we preserve L-scale variability reasonably well while strongly
+    damping shorter scales.
+
+    Parameters
+    ----------
+    t_obs, v_obs : array-like
+        Irregular observation times and values.
+    grid : array-like
+        Grid times at which to evaluate the smoothed series.
+    L : float
+        Target timescale (time units).
+    window_half_width_factor : float
+        Half-width = window_half_width_factor * L (default 0.5 => L/2).
+    sigma_factor : float
+        Gaussian σ = window_half_width * sigma_factor (default 1/3 => 3σ = half-width).
+    weight_threshold : float
+        Minimum total weight required to accept a smoothed value.
+
+    Returns
+    -------
+    vals : np.ndarray
+        Smoothed values at each grid point (NaN where not enough support).
     """
     t = np.asarray(t_obs, float)
     v = np.asarray(v_obs, float)
+    grid = np.asarray(grid, float)
+    # print the shape of grid
+    # print("Shape of grid:", grid.shape)
 
-    # ------------------------------------------------------------------
-    # 0. Basic checks
-    # ------------------------------------------------------------------
-    if t.size == 0:
-        raise ValueError("No observations provided.")
-
-    # sort by time
+    # sort observations by time
     order = np.argsort(t)
     t = t[order]
     v = v[order]
 
-    # ------------------------------------------------------------------
-    # 1. Choose scale L and grid
-    # ------------------------------------------------------------------
-    if L is None:
-        # fallback: typical sampling interval
-        L = np.median(np.diff(t))
+    vals = np.full(grid.shape, np.nan, dtype=float)
 
-    if grid is None:
-        # # define a 'dense enough' grid: e.g., dt_grid = min_dt / 5
-        # dt_min = np.min(np.diff(t))
-        # dt_grid = dt_min/2
-        # grid = np.arange(t.min(), t.max() + dt_grid*0.5, dt_grid)
-        grid =np.arange(np.min(t), np.max(t)+L/20, L/10)
-    else:
-        grid = np.asarray(grid, float)
-        # ensure sorted
-        grid = np.sort(grid)
+    if t.size == 0:
+        return vals
 
-    # ------------------------------------------------------------------
-    # 2. Interpolate irregular data onto the grid
-    # ------------------------------------------------------------------
-    # linear interpolation, no extrapolation outside [t.min(), t.max()]
-    v_interp = np.interp(grid, t, v)
+    half_width = window_half_width_factor * L
+    sigma = half_width * sigma_factor  # default: sigma = (L/2) / 3 = L/6
 
-    # ------------------------------------------------------------------
-    # 3. Build Gaussian kernel with half-width ≈ window_half_width_factor * L
-    # ------------------------------------------------------------------
-    half_width = window_half_width_factor * L        # default: L/2
-    sigma      = half_width * sigma_factor           # default: 3σ = half_width
+    for i, tau in enumerate(grid):
+        # restrict to points within half-width window
+        mask = np.abs(t - tau) <= half_width
+        if not np.any(mask):
+            continue
 
-    # if sigma is degenerate, just return the interpolated series
-    if sigma <= 0:
-        vals = v_interp.copy()
-        if if_plot_smoothed:
-            plot_smoothed(t_obs, v_obs, grid, vals, L)
-        return grid, vals
+        d = t[mask] - tau
+        w = np.exp(-0.5 * (d / sigma) ** 2)
+        W = w.sum()
+        if W < weight_threshold:
+            continue
 
-    dt_grid = np.median(np.diff(grid))
-    # number of grid steps to cover the half_width
-    n_half = int(np.ceil(half_width / dt_grid))
+        vals[i] = np.dot(w, v[mask]) / W
 
-    if n_half < 1:
-        # kernel would be a single point; again just return interpolated
-        vals = v_interp.copy()
-        if if_plot_smoothed:
-            plot_smoothed(t_obs, v_obs, grid, vals, L)
-        return grid, vals
+    # resample the vals at the orinal data time steps
+    smooth_interp=interp1d(grid,vals)
+    # make sure t are inside grid, drop t outside of it
+    t= np.clip(t, grid[0], grid[-1])
 
-    # kernel support in time
-    k_t = np.arange(-n_half, n_half + 1) * dt_grid
-    kernel = np.exp(-0.5 * (k_t / sigma) ** 2)
-    kernel /= kernel.sum()   # normalize to unit sum
+    smoothed=smooth_interp(t)
 
-    # ------------------------------------------------------------------
-    # 4. Convolve interpolated data with Gaussian kernel
-    # ------------------------------------------------------------------
-    vals = np.convolve(v_interp, kernel, mode="same")
-
-    # # interpolate the smoothed values with a step of L/2
-    # t_smoothed=np.arange(grid[0], grid[-1], L/2)
-    # v_smoothed = interp1d(grid, vals, kind="linear")(t_smoothed)
-
-    # ------------------------------------------------------------------
-    # 5. Optional plot using your existing green-span logic
-    # ------------------------------------------------------------------
-    t_smoothed = grid
-    v_smoothed = vals
-
-    if if_plot_smoothed:
-        plot_smoothed(t_obs, v_obs, t_smoothed, v_smoothed, L)
-
-    return t_smoothed, v_smoothed
+    return t, smoothed
 
 
+# ------------------------------------------------------------
+# 3. Gap-based support mask at scale L
+# ------------------------------------------------------------
+
+
+def support_mask_from_gaps(
+    t_smoothed: np.ndarray,
+    v_smoothed: np.ndarray,
+    L: float,
+    if_plot_supported: bool = False,
+) -> np.ndarray:
+    """
+    For each grid point, decide if it's within a segment where original
+    data gaps are < L/2.
+
+    For a grid time tau:
+        - Find i such that t_obs[i-1] <= tau <= t_obs[i]
+        - If such bracket exists and gap = t_obs[i] - t_obs[i-1] <= L/2,
+          then tau is considered supported.
+
+    Parameters
+    ----------
+    t_obs : array-like
+        Irregular observation times (1D, not necessarily sorted).
+    grid : array-like
+        Grid times where we have smoothed values.
+    L : float
+        Smoothing length / resolution scale.
+
+    Returns
+    -------
+    support : np.ndarray (bool)
+        Support mask for each grid time.
+    """
+    t_smoothed = np.sort(np.asarray(t_smoothed, float))
+    # grid = np.asarray(grid, float)
+
+    support = np.zeros(t_smoothed.shape, dtype=bool)
+
+    if t_smoothed.size < 2:
+        return support  # no gaps to define
+
+    half_L = 0.5 * L
+
+    # for i, tau in enumerate(grid):
+    #     # Find where tau would be inserted to keep t sorted
+    #     idx = np.searchsorted(t, tau)
+    #     if idx == 0 or idx == t.size:
+    #         continue  # tau outside the bracket of observed times
+
+    #     # Gap across the bracket containing tau
+    #     gap = t[idx] - t[idx - 1]
+    #     if gap <= half_L:
+    #         support[i] = True
+
+    # loop over t, if t+1-t>half_L, then tau is not supported
+    for i in range(len(t_smoothed)-1):
+        if t_smoothed[i+1]-t_smoothed[i]>half_L:
+            support[i] = False
+        else:
+            support[i] = True
+
+    if if_plot_supported:
+        plot_supported(t_smoothed, v_smoothed, support, L)
+
+    return support
 
 
 
-
-
-
-def plot_smoothed(t_obs, v_obs, t_smoothed, v_smoothed, L):
+def plot_supported(t_smoothed, v_smoothed, support, L):
     """
     Plot the smoothed series with supported regions highlighted.
 
@@ -212,169 +253,15 @@ def plot_smoothed(t_obs, v_obs, t_smoothed, v_smoothed, L):
         Scale L (for annotation).
     """
     plt.figure(figsize=(12, 3))
-    plt.plot(t_obs, v_obs, 'b-', label='Observations')
-    plt.plot(t_smoothed, v_smoothed, 'r-', label='Smoothed Series')
-    
-    # calculate 'support' which is at where t_obs[i+1]-t_obs[i]<=L/2, it is boolean array
-    support = np.zeros(len(t_obs), dtype=bool)
-    for i in range(len(t_obs)-1):
-        if t_obs[i+1]-t_obs[i]<=L/2:
-            support[i]=True
-            support[i+1]=True   
-        else:
-            support[i]=False
-            support[i+1]=False
-
-    # find the continous regions without NaNs, mark them by green vertical bands
-
-    for i in range(len(support)-1):
-        if support[i]:
-            plt.axvspan(t_obs[i], t_obs[i+1], facecolor='g', alpha=0.2, edgecolor='none')
-  
-    plt.title(f'Smoothed Series with Supported Regions (L={L})')
-    plt.xlabel('Time')
-    plt.ylabel('Smoothed Value')
-    plt.legend()
-    plt.show()
-
-
-
-# ------------------------------------------------------------
-# 3. Gap-based support mask at scale L
-# ------------------------------------------------------------
-
-
-
-
-
-
-def support_mask_from_gaps(
-    t_obs: np.ndarray,
-    t_smoothed: np.ndarray=None,
-    v_smoothed: np.ndarray=None,  # only needed for plotting
-    L: float=None,
-    if_plot_supported: bool = False,
-) -> np.ndarray:
-    """
-    For each grid point τ, check if it lies within an interval [t_i, t_{i+1}]
-    where the original gap t_{i+1} - t_i <= L/2.
-    """
-    t_obs = np.sort(np.asarray(t_obs, float))
-
-    # if grid is None:
-    #     grid=np.arange(np.min(t_obs), np.max(t_obs), L/2)
-    # else:
-    t_smoothed = np.asarray(t_smoothed, float)
-    half_L = 0.5 * L
-
-    support = np.zeros(t_smoothed.shape, dtype=bool)
-
-    if t_obs.size < 2:
-        return support
-
-    # Precompute gaps and valid intervals
-    gaps = np.diff(t_obs)
-    valid_intervals = gaps <= half_L  # boolean array of length len(t_obs)-1
-
-    # create a boolean array of length len(grid). if t_obs[i+1]-t_obs[i]>L/2, set the corresponding grid point to False
-    support_mask = np.zeros(t_smoothed.shape, dtype=bool)
-    for i in range(len(t_obs)-1):
-        if valid_intervals[i]:
-            # find the grid points between t_obs[i] and t_obs[i+1]
-            mask = (t_smoothed >= t_obs[i]) & (t_smoothed <= t_obs[i+1])
-            support_mask[mask] = True
-
-    # # For each grid point, find which interval it falls into
-    # indices = np.searchsorted(t_obs, grid, side='right') - 1
-    # # indices[i] is such that t_obs[indices[i]] <= grid[i] < t_obs[indices[i]+1]
-
-    # valid_mask = (indices >= 0) & (indices < len(valid_intervals))
-    # support[valid_mask] = valid_intervals[indices[valid_mask]]
-
-    if if_plot_supported:
-        plot_supported(t_smoothed, v_smoothed, support_mask, L)
-
-    return support_mask
-
-
-
-
-
-
-
-# def support_mask_from_gaps(
-#     t_obs: np.ndarray,
-#     grid: np.ndarray,
-#     L: float,
-#     if_plot_supported: bool = False,
-#     v_smoothed: Optional[np.ndarray] = None,  # only needed for plotting
-# ) -> np.ndarray:
-#     """
-#     For each grid point τ, check if it lies within an interval [t_i, t_{i+1}]
-#     where the original gap t_{i+1} - t_i <= L/2.
-#     """
-#     t_obs = np.sort(np.asarray(t_obs, float))
-#     grid = np.asarray(grid, float)
-#     half_L = 0.5 * L
-
-#     support = np.zeros(grid.shape, dtype=bool)
-
-#     if t_obs.size < 2:
-#         return support
-
-#     # Precompute gaps and valid intervals
-#     gaps = np.diff(t_obs)
-#     valid_intervals = gaps <= half_L  # boolean array of length len(t_obs)-1
-
-#     # For each grid point, find which interval it falls into
-#     indices = np.searchsorted(t_obs, grid, side='right') - 1
-#     # indices[i] is such that t_obs[indices[i]] <= grid[i] < t_obs[indices[i]+1]
-
-#     valid_mask = (indices >= 0) & (indices < len(valid_intervals))
-#     support[valid_mask] = valid_intervals[indices[valid_mask]]
-
-#     if if_plot_supported:
-#         plot_supported(grid, v_smoothed, support, L)
-
-#     return support
-
-
-
-
-
-
-
-
-
-
-
-
-
-def plot_supported(t_smoothed, v_smoothed, support_mask, L):
-    """
-    Plot the smoothed series with supported regions highlighted.
-
-    Parameters
-    ----------
-    t_smoothed : array-like
-        Times of the smoothed series.
-    v_smoothed : array-like
-        Smoothed values.
-    support_mask : array-like (bool)
-        Support mask for each time point.
-    L : float
-        Scale L (for annotation).
-    """
-    plt.figure(figsize=(12, 3))
     plt.plot(t_smoothed, v_smoothed, 'b-', label='Smoothed Series')
     # plot the smoothed curve after the support check
-    v_smoothed_masked = np.where(support_mask, v_smoothed, np.nan)
+    v_smoothed_masked = np.where(support, v_smoothed, np.nan)
     plt.plot(t_smoothed, v_smoothed_masked+4, 'r-', label='Smoothed Series (Supported)')
 
-    # # Highlight supported regions
-    # # find the continous regions without NaNs, mark them by green vertical bands
-    for i in range(len(support_mask)-1):
-        if support_mask[i]:
+    # Highlight supported regions
+    # find the continous regions without NaNs, mark them by green vertical bands
+    for i in range(len(support)):
+        if support[i]:
             plt.axvspan(t_smoothed[i], t_smoothed[i+1], facecolor='g', alpha=0.2, edgecolor='none')
   
     plt.title(f'Smoothed Series with Supported Regions (L={L})')
@@ -383,34 +270,6 @@ def plot_supported(t_smoothed, v_smoothed, support_mask, L):
     plt.legend()
     plt.show()
 
-
-
-
-
-# def plot_supported(t_smoothed, v_smoothed, support_mask, L):
-#     plt.figure(figsize=(12, 3))
-#     plt.plot(t_smoothed, v_smoothed, 'b-', label='Smoothed Series')
-
-#     # supported red curve (vertically offset just for visibility)
-#     v_smoothed_masked = np.where(support_mask, v_smoothed, np.nan)
-#     plt.plot(t_smoothed, v_smoothed_masked + 4, 'r-', label='Smoothed Series (Supported)')
-
-#     # --- highlight supported regions as contiguous blocks ---
-#     good = support_mask
-
-#     # indices where support turns on/off
-#     starts = np.where(np.diff(np.concatenate([[False], good])) == 1)[0]
-#     ends   = np.where(np.diff(np.concatenate([good, [False]])) == -1)[0]
-
-#     for s, e in zip(starts, ends):
-#         # shade from first True index to last True index
-#         plt.axvspan(t_smoothed[s], t_smoothed[e], facecolor='g', alpha=0.2, edgecolor='none')
-
-#     plt.title(f'Smoothed Series with Supported Regions (L={L})')
-#     plt.xlabel('Time')
-#     plt.ylabel('Smoothed Value')
-#     plt.legend()
-#     plt.show()
 
 
 
@@ -850,37 +709,34 @@ def compute_miste_single_scale(
     if t_max - t_min < 2 * L:
         return np.nan
 
-    dt_grid = L/10
+    dt_grid = grid_step_factor * L
     grid = np.arange(t_min, t_max + dt_grid / 2.0, dt_grid)
     if grid.size < 3:
         return np.nan
 
-
-    # 1) Smooth each series at scale L via Gaussian kernel on COMMON GRID
-    t_x_smoothed, x_smoothed = smooth_gaussian_irregular(
-        t_x, x_vals, grid,L,
+    # 1) Smooth each series at scale L via Gaussian kernel (window ≤ L/2)
+    t_x_smoothed,x_smoothed = smooth_gaussian_irregular(
+        t_x, x_vals, grid, L,
         window_half_width_factor=window_half_width_factor,
         sigma_factor=sigma_factor,
     )
-
-    t_y_smoothed, y_smoothed = smooth_gaussian_irregular(
-        t_y, y_vals, grid,L,
+    t_y_smoothed,y_smoothed = smooth_gaussian_irregular(
+        t_y, y_vals, grid, L,
         window_half_width_factor=window_half_width_factor,
         sigma_factor=sigma_factor,
     )
-
-    # Since both use the same 'grid', grid_x == grid_y == grid
-    # So we can just use 'grid'
 
     # 2) Construct support masks based on original gaps < L/2
-    support_x = support_mask_from_gaps(t_x, t_x_smoothed, x_smoothed,L)
-    support_y = support_mask_from_gaps(t_y, t_y_smoothed, y_smoothed,L)
+    support_x = support_mask_from_gaps(t_x_smoothed, x_smoothed, L)
+    support_y = support_mask_from_gaps(t_y_smoothed, y_smoothed, L)
 
-    x_smoothed_supported = np.where(support_x, x_smoothed, np.nan)
-    y_smoothed_supported = np.where(support_y, y_smoothed, np.nan)
+    x_smoothed_supported =  np.where(support_x, x_smoothed, np.nan)
+    y_smoothed_supported =  np.where(support_y, y_smoothed, np.nan)
 
-    # Now support_x and support_y have same length = len(grid)
-    support_xy = support_x & support_y & np.isfinite(x_smoothed) & np.isfinite(y_smoothed)
+    # Combined support mask where both series and smoothed values are valid
+    support_xy = (
+        support_x & support_y
+    )
 
     # Valid transitions: both n and n+1 lie within supported regions
     valid_idx = np.where(support_xy[:-1] & support_xy[1:])[0]
@@ -1091,37 +947,35 @@ def compute_miste_single_scale_with_surrogates(
     if t_max - t_min < 2 * L:
         return np.nan, np.full(n_surrogates, np.nan), np.nan
 
-    dt_grid = L/10
+    dt_grid = grid_step_factor * L
     grid = np.arange(t_min, t_max + dt_grid / 2.0, dt_grid)
     if grid.size < 3:
         return np.nan, np.full(n_surrogates, np.nan), np.nan
 
-
-    # 1) Smooth each series at scale L via Gaussian kernel on COMMON GRID
-    t_x_smoothed, x_smoothed = smooth_gaussian_irregular(
+    # 1) Smooth each series at scale L via Gaussian kernel (window ≤ L/2)
+    t_x_smoothed,x_smoothed = smooth_gaussian_irregular(
         t_x, x_vals, grid, L,
         window_half_width_factor=window_half_width_factor,
         sigma_factor=sigma_factor,
     )
-
-    t_y_smoothed, y_smoothed = smooth_gaussian_irregular(
+    t_y_smoothed,y_smoothed = smooth_gaussian_irregular(
         t_y, y_vals, grid, L,
         window_half_width_factor=window_half_width_factor,
         sigma_factor=sigma_factor,
     )
 
-    # Since both use the same 'grid', grid_x == grid_y == grid
-    # So we can just use 'grid'
-
     # 2) Construct support masks based on original gaps < L/2
-    support_x = support_mask_from_gaps(t_x, t_x_smoothed, x_smoothed, L)
-    support_y = support_mask_from_gaps(t_y, t_y_smoothed, y_smoothed, L)
+    support_x = support_mask_from_gaps(t_x_smoothed, x_smoothed, L/2)
+    support_y = support_mask_from_gaps(t_y_smoothed, y_smoothed, L/2)
 
-    x_smoothed_supported = np.where(support_x, x_smoothed, np.nan)
-    y_smoothed_supported = np.where(support_y, y_smoothed, np.nan)
+    x_smoothed_supported =  np.where(support_x, x_smoothed, np.nan)
+    y_smoothed_supported =  np.where(support_y, y_smoothed, np.nan)
 
-    # Now support_x and support_y have same length = len(grid)
-    support_xy = support_x & support_y & np.isfinite(x_smoothed) & np.isfinite(y_smoothed)
+    # Combined support mask where both series and smoothed values are valid
+    support_xy = (
+        support_x & support_y &
+        np.isfinite(x_smoothed_supported) & np.isfinite(y_smoothed_supported)
+    )
 
     # Valid transitions: both n and n+1 lie within supported regions
     valid_idx = np.where(support_xy[:-1] & support_xy[1:])[0]
