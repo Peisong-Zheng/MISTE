@@ -24,6 +24,10 @@ from typing import Sequence, Tuple, Optional
 # Import your ObservedSeries dataclass from syn_data.py
 # from syn_data import ObservedSeries
 
+try:
+    from pyinform import transfer_entropy as _inform_te
+except ImportError:
+    _inform_te = None
 
 # ------------------------------------------------------------
 # 1. Gap-based scales L from age gaps
@@ -76,6 +80,8 @@ def compute_gap_scales(
 # ------------------------------------------------------------
 # 2. Gaussian kernel smoothing at scale L
 # ------------------------------------------------------------
+# import interpolate
+
 
 def smooth_gaussian_irregular(
     t_obs: np.ndarray,
@@ -122,6 +128,8 @@ def smooth_gaussian_irregular(
     t = np.asarray(t_obs, float)
     v = np.asarray(v_obs, float)
     grid = np.asarray(grid, float)
+    # print the shape of grid
+    # print("Shape of grid:", grid.shape)
 
     # sort observations by time
     order = np.argsort(t)
@@ -149,6 +157,9 @@ def smooth_gaussian_irregular(
             continue
 
         vals[i] = np.dot(w, v[mask]) / W
+
+    # resample the vals at the orinal data time steps
+    # vals_resampled =
 
     return vals
 
@@ -209,72 +220,6 @@ def support_mask_from_gaps(
     return support
 
 
-# ------------------------------------------------------------
-# 4. Linear-Gaussian TE at lag 1 (optional)
-# ------------------------------------------------------------
-
-# def gaussian_te_lag1(
-#     Y_future: np.ndarray,
-#     Y_past: np.ndarray,
-#     X_past: np.ndarray,
-# ) -> float:
-#     """
-#     Estimate TE (bits) from X -> Y at lag 1 under a linear-Gaussian model.
-
-#     T_{X->Y} = 0.5 * log( var(e_Y|Ypast) / var(e_Y|Ypast,Xpast) ) / log(2)
-
-#     This is Granger causality expressed in TE units, and is valid if the
-#     underlying process is linear + Gaussian.
-
-#     Parameters
-#     ----------
-#     Y_future : array-like
-#         Y at time n+1.
-#     Y_past : array-like
-#         Y at time n.
-#     X_past : array-like
-#         X at time n.
-
-#     Returns
-#     -------
-#     TE_bits : float
-#         Transfer entropy in bits. NaN if too few samples or degenerate.
-#     """
-#     Yf = np.asarray(Y_future, float)
-#     Yp = np.asarray(Y_past, float)
-#     Xp = np.asarray(X_past, float)
-
-#     mask = np.isfinite(Yf) & np.isfinite(Yp) & np.isfinite(Xp)
-#     Yf = Yf[mask]
-#     Yp = Yp[mask]
-#     Xp = Xp[mask]
-
-#     N = Yf.size
-#     if N <= 5:
-#         return np.nan
-
-#     # Model 1: Yf ~ a0 + a1 Yp
-#     A = np.column_stack([np.ones(N), Yp])
-#     beta_A, *_ = np.linalg.lstsq(A, Yf, rcond=None)
-#     res_A = Yf - A @ beta_A
-#     kA = A.shape[1]
-#     dof_A = max(N - kA, 1)
-#     var_A = np.sum(res_A**2) / dof_A
-
-#     # Model 2: Yf ~ b0 + b1 Yp + b2 Xp
-#     B = np.column_stack([np.ones(N), Yp, Xp])
-#     beta_B, *_ = np.linalg.lstsq(B, Yf, rcond=None)
-#     res_B = Yf - B @ beta_B
-#     kB = B.shape[1]
-#     dof_B = max(N - kB, 1)
-#     var_B = np.sum(res_B**2) / dof_B
-
-#     if var_A <= 0 or var_B <= 0:
-#         return np.nan
-
-#     te_nats = 0.5 * np.log(var_A / var_B)
-#     te_bits = te_nats / np.log(2.0)
-#     return te_bits
 
 
 
@@ -397,7 +342,7 @@ def binned_te_lag1(
     n_bins_y: int = 6,
     n_bins_y_future: Optional[int] = None,
     binning: str = "quantile",
-    alpha: float = 1.0,
+    alpha: float = 1e-6,
     min_samples: int = 50,
 ) -> float:
     """
@@ -501,6 +446,12 @@ def binned_te_lag1(
 
 
 
+
+
+
+
+
+
 # functions to plot alignment
 
 import matplotlib.pyplot as plt
@@ -523,7 +474,7 @@ def _segments_from_mask(grid: np.ndarray, mask: np.ndarray):
         segments.append((grid[start_idx], grid[len(mask) - 1]))
 
     return segments
-
+ 
 
 def _segments_from_valid_idx(grid: np.ndarray, valid_idx: np.ndarray):
     """
@@ -656,7 +607,7 @@ def compute_miste_single_scale(
     window_half_width_factor: float = 0.5,
     sigma_factor: float = 1/3,
     min_valid_data_length: int = 30,
-    te_method: str = "binned",
+    te_method : {"binned", "gaussian", "pyinform"} = "binned",
     if_plot_alignment: bool = False,
     te_kwargs: Optional[dict] = None,
 ) -> float:
@@ -772,15 +723,289 @@ def compute_miste_single_scale(
     # 3) Choose TE estimator
     if te_method == "gaussian":
         return gaussian_te_lag1(Y_future, Y_past, X_past)
+
     elif te_method == "binned":
         return binned_te_lag1(Y_future, Y_past, X_past, **te_kwargs)
+
     else:
         raise ValueError(f"Unknown te_method: {te_method}")
 
 
-# ------------------------------------------------------------
-# 7. Multiscale MISTE for a single age model
-# ------------------------------------------------------------
+def plot_single_scale_surrogates_hist(
+    TE_obs: float,
+    TE_surr: np.ndarray,
+    p_value: float,
+    L: Optional[float] = None,
+    ax: Optional[plt.Axes] = None,
+    bins: int = 30,
+    density: bool = False,
+    color_hist: str = "C0",
+    color_obs: str = "C3",
+):
+    """
+    Visualize surrogate TE distribution at a single scale with a histogram
+    and a vertical line marking the observed TE.
+
+    Parameters
+    ----------
+    TE_obs : float
+        Observed TE at this scale.
+    TE_surr : array-like
+        Surrogate TE values (length n_surrogates).
+    p_value : float
+        Right-tailed p-value: P(TE_surr >= TE_obs).
+    L : float or None
+        Optional scale label (for title).
+    ax : matplotlib Axes or None
+        Axis to plot on. If None, a new figure and axis are created.
+    bins : int
+        Number of histogram bins.
+    density : bool
+        If True, plot probability density; else plot counts.
+    color_hist : str
+        Color for histogram bars.
+    color_obs : str
+        Color for observed TE vertical line.
+
+    Returns
+    -------
+    fig, ax : matplotlib Figure and Axes
+    """
+    TE_surr = np.asarray(TE_surr, float)
+    finite = np.isfinite(TE_surr)
+    TE_surr = TE_surr[finite]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+    else:
+        fig = ax.figure
+
+    if TE_surr.size == 0 or not np.isfinite(TE_obs):
+        ax.text(
+            0.5, 0.5,
+            "No valid surrogates or observed TE is NaN",
+            ha="center", va="center", transform=ax.transAxes
+        )
+        ax.set_axis_off()
+        return fig, ax
+
+    # Histogram of surrogate TE
+    ax.hist(
+        TE_surr,
+        bins=bins,
+        density=density,
+        color=color_hist,
+        alpha=0.7,
+        edgecolor="black",
+    )
+
+    # Vertical line for observed TE
+    ax.axvline(TE_obs, color=color_obs, linestyle="--", linewidth=2,
+               label=f"Observed TE = {TE_obs:.3g}")
+
+    # Basic stats of surrogate distribution
+    mu = TE_surr.mean()
+    sd = TE_surr.std(ddof=1) if TE_surr.size > 1 else np.nan
+
+    # Text annotation in upper-right corner
+    text_lines = [
+        f"Mean(surr) = {mu:.3g}",
+        f"Std(surr)  = {sd:.3g}" if np.isfinite(sd) else "Std(surr)  = n/a",
+        f"p (TE_surr ≥ TE_obs) = {p_value:.3g}" if np.isfinite(p_value) else "p = n/a",
+    ]
+    ax.text(
+        0.97, 0.97,
+        "\n".join(text_lines),
+        ha="right", va="top",
+        transform=ax.transAxes,
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
+    )
+
+    if L is not None:
+        ax.set_title(f"Surrogate TE distribution at scale L = {L:.3g}")
+    else:
+        ax.set_title("Surrogate TE distribution")
+
+    ax.set_xlabel("TE (bits)")
+    ax.set_ylabel("Density" if density else "Count")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    return fig, ax
+
+
+def compute_miste_single_scale_with_surrogates(
+    t_x: np.ndarray,
+    x_vals: np.ndarray,
+    t_y: np.ndarray,
+    y_vals: np.ndarray,
+    L: float,
+    grid_step_factor: float = 0.5,
+    window_half_width_factor: float = 0.5,
+    sigma_factor: float = 1/3,
+    min_valid_data_length: int = 30,
+    te_method: str = "binned",  # "binned" or "gaussian"
+    n_surrogates: int = 1000,
+    surrogate_mode: str = "shuffle_xpast",  # currently only this mode
+    if_plot_alignment: bool = False,
+    if_plot_surrogates: bool = False,
+    te_kwargs: Optional[dict] = None,
+    random_state: Optional[int] = None,
+):
+    """
+    Compute MISTE TE (X->Y) at a single scale L for one age model,
+    and assess its significance against a surrogate null.
+
+    Surrogate strategy (default):
+      - Keep Y_past, Y_future fixed
+      - Shuffle X_past across all valid transitions (no cross-segment jumps
+        exist at this stage).
+      - Recompute TE for each surrogate.
+
+    Parameters
+    ----------
+    (Same as compute_miste_single_scale) plus:
+    n_surrogates : int
+        Number of surrogate realizations.
+    surrogate_mode : {"shuffle_xpast"}
+        How to build surrogates. Currently only shuffling X_past is implemented.
+    random_state : int or None
+        Seed for reproducibility.
+
+    Returns
+    -------
+    TE_obs : float
+        Observed TE (bits) at scale L.
+    TE_surr : np.ndarray
+        Surrogate TE values (length n_surrogates).
+    p_value : float
+        One-sided p-value: P(TE_surr >= TE_obs).
+        NaN if TE_obs or all surrogates are NaN.
+    """
+    if te_kwargs is None:
+        te_kwargs = {}
+
+    t_x = np.asarray(t_x, float)
+    t_y = np.asarray(t_y, float)
+    x_vals = np.asarray(x_vals, float)
+    y_vals = np.asarray(y_vals, float)
+
+    # Overlapping domain in time
+    t_min = max(t_x.min(), t_y.min())
+    t_max = min(t_x.max(), t_y.max())
+
+    if t_max - t_min < 2 * L:
+        return np.nan, np.full(n_surrogates, np.nan), np.nan
+
+    dt_grid = grid_step_factor * L
+    grid = np.arange(t_min, t_max + dt_grid / 2.0, dt_grid)
+    if grid.size < 3:
+        return np.nan, np.full(n_surrogates, np.nan), np.nan
+
+    # 1) Smooth each series at scale L via Gaussian kernel (window ≤ L/2)
+    x_grid = smooth_gaussian_irregular(
+        t_x, x_vals, grid, L,
+        window_half_width_factor=window_half_width_factor,
+        sigma_factor=sigma_factor,
+    )
+    y_grid = smooth_gaussian_irregular(
+        t_y, y_vals, grid, L,
+        window_half_width_factor=window_half_width_factor,
+        sigma_factor=sigma_factor,
+    )
+
+    # 2) Construct support masks based on original gaps < L/2
+    support_x = support_mask_from_gaps(t_x, grid, L)
+    support_y = support_mask_from_gaps(t_y, grid, L)
+
+    # Combined support mask where both series and smoothed values are valid
+    support_xy = (
+        support_x & support_y &
+        np.isfinite(x_grid) & np.isfinite(y_grid)
+    )
+
+    # Valid transitions: both n and n+1 lie within supported regions
+    valid_idx = np.where(support_xy[:-1] & support_xy[1:])[0]
+    if valid_idx.size < min_valid_data_length:
+        return np.nan, np.full(n_surrogates, np.nan), np.nan
+
+    # Optional alignment plot
+    if if_plot_alignment:
+        plot_alignment(
+            t_x=t_x,
+            x_vals=x_vals,
+            t_y=t_y,
+            y_vals=y_vals,
+            grid=grid,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            support_x=support_x,
+            support_y=support_y,
+            support_xy=support_xy,
+            valid_idx=valid_idx,
+            L=L,
+        )
+
+    # Extract lag-1 transitions (no cross-segment jumps because of the mask)
+    Y_future = y_grid[valid_idx + 1]
+    Y_past = y_grid[valid_idx]
+    X_past = x_grid[valid_idx]
+
+    # -----------------------------
+    # 1) Observed TE at this scale
+    # -----------------------------
+    if te_method == "gaussian":
+        TE_obs = gaussian_te_lag1(Y_future, Y_past, X_past)
+    elif te_method == "binned":
+        TE_obs = binned_te_lag1(Y_future, Y_past, X_past, **te_kwargs)
+    else:
+        raise ValueError(f"Unknown te_method: {te_method}")
+
+    # If observed TE is NaN, there's nothing to test
+    if not np.isfinite(TE_obs):
+        return TE_obs, np.full(n_surrogates, np.nan), np.nan
+
+    # -----------------------------
+    # 2) Surrogate distribution
+    # -----------------------------
+    rng = np.random.default_rng(random_state)
+    TE_surr = np.full(n_surrogates, np.nan, dtype=float)
+
+    for s in range(n_surrogates):
+        if surrogate_mode == "shuffle_xpast":
+            X_past_surr = rng.permutation(X_past)
+        else:
+            raise ValueError(f"Unknown surrogate_mode: {surrogate_mode}")
+
+        if te_method == "gaussian":
+            TE_surr[s] = gaussian_te_lag1(Y_future, Y_past, X_past_surr)
+        elif te_method == "binned":
+            TE_surr[s] = binned_te_lag1(Y_future, Y_past, X_past_surr, **te_kwargs)
+
+    # -----------------------------
+    # 3) p-value (right-tailed)
+    # -----------------------------
+    finite_mask = np.isfinite(TE_surr)
+    n_eff = finite_mask.sum()
+    if n_eff == 0:
+        p_value = np.nan
+    else:
+        # right-tailed: P(TE_surr >= TE_obs); add 1 in numerator/denominator
+        # for a small-sample unbiased estimate
+        p_value = (1 + np.sum(TE_surr[finite_mask] >= TE_obs)) / (1 + n_eff)
+
+    # Optional surrogate histogram plot
+    if if_plot_surrogates:
+        plot_single_scale_surrogates_hist(
+            TE_obs=TE_obs,
+            TE_surr=TE_surr,
+            p_value=p_value,
+            L=L,
+        )
+
+    return TE_obs, TE_surr, p_value
+
 
 def compute_miste_multiscale(
     t_x: np.ndarray,
@@ -788,6 +1013,7 @@ def compute_miste_multiscale(
     t_y: np.ndarray,
     y_vals: np.ndarray,
     quantiles: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+    if_plot_surrogates: bool = False,
     **single_scale_kwargs,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -822,6 +1048,392 @@ def compute_miste_multiscale(
         )
 
     return L_values, TE_values
+
+
+
+
+
+
+# ------------------------------------------------------------
+# 7. Multiscale MISTE for a single age model
+# ------------------------------------------------------------
+
+
+# def plot_multiscale_surrogates_summary(
+#     L_values: np.ndarray,
+#     TE_obs: np.ndarray,
+#     TE_surr_mean: np.ndarray,
+#     TE_surr_std: np.ndarray,
+#     TE_surr_all: np.ndarray,
+#     p_values: np.ndarray,
+#     alpha: float = 0.05,
+#     xscale_log: bool = False,
+#     figsize=(6, 3),
+# ):
+#     """
+#     Summarize multiscale TE with surrogate-based significance.
+
+#     Plot:
+#       - Observed TE(L) as points/line.
+#       - Surrogate band (5th to 95th percentile of surrogates at each L).
+#       - Surrogate mean as dashed line.
+#       - Significant scales (p < alpha) highlighted.
+
+#     Parameters
+#     ----------
+#     L_values : array-like, shape (n_L,)
+#         Scales L (time units).
+#     TE_obs : array-like, shape (n_L,)
+#         Observed TE(L).
+#     TE_surr_mean : array-like, shape (n_L,)
+#         Mean surrogate TE(L).
+#     TE_surr_std : array-like, shape (n_L,)
+#         Std surrogate TE(L).
+#     TE_surr_all : array-like, shape (n_L, n_surrogates)
+#         All surrogate TE values per scale.
+#     p_values : array-like, shape (n_L,)
+#         P-values at each scale.
+#     """
+#     L_values = np.asarray(L_values, float)
+#     TE_obs = np.asarray(TE_obs, float)
+#     TE_surr_mean = np.asarray(TE_surr_mean, float)
+#     TE_surr_std = np.asarray(TE_surr_std, float)
+#     TE_surr_all = np.asarray(TE_surr_all, float)
+#     p_values = np.asarray(p_values, float)
+
+#     # TE_surr_all is (n_L, n_surrogates); take quantiles across surrogates
+#     # Use nanpercentile to ignore NaNs in surrogate TE
+#     if TE_surr_all.ndim != 2 or TE_surr_all.shape[0] != L_values.size:
+#         raise ValueError(
+#             "TE_surr_all must have shape (n_L, n_surrogates) with "
+#             "n_L == L_values.size."
+#         )
+
+#     TE_lower = np.nanpercentile(TE_surr_all, 5, axis=1)
+#     TE_upper = np.nanpercentile(TE_surr_all, 95, axis=1)
+
+#     fig, ax_te = plt.subplots(1, 1, figsize=figsize)
+
+#     # --------------------------
+#     # Surrogate 5–95% band
+#     # --------------------------
+#     finite_band = np.isfinite(TE_lower) & np.isfinite(TE_upper)
+#     if finite_band.any():
+#         ax_te.fill_between(
+#             L_values[finite_band],
+#             TE_lower[finite_band],
+#             TE_upper[finite_band],
+#             color="C0",
+#             alpha=0.2,
+#             label="Surrogate 5–95% band",
+#         )
+#         ax_te.plot(
+#             L_values[finite_band],
+#             TE_surr_mean[finite_band],
+#             "C0--",
+#             linewidth=1,
+#             label="Surrogate mean",
+#         )
+
+#     # --------------------------
+#     # Observed TE
+#     # --------------------------
+#     ax_te.plot(
+#         L_values,
+#         TE_obs,
+#         "o-",
+#         color="C3",
+#         label="Observed TE",
+#     )
+
+#     # Highlight significant points
+#     sig_mask = np.isfinite(p_values) & (p_values < alpha) & np.isfinite(TE_obs)
+#     if sig_mask.any():
+#         ax_te.scatter(
+#             L_values[sig_mask],
+#             TE_obs[sig_mask],
+#             s=60,
+#             facecolor="none",
+#             edgecolor="k",
+#             linewidth=1.5,
+#             label=f"p < {alpha:g}",
+#             zorder=5,
+#         )
+
+#     ax_te.set_ylabel("TE X → Y (bits)")
+#     ax_te.set_title("Multiscale TE with surrogate-based significance")
+#     ax_te.grid(True, alpha=0.3)
+#     ax_te.legend()
+
+#     if xscale_log:
+#         ax_te.set_xscale("log")
+
+#     ax_te.set_xlabel("Scale L (time units)")
+#     plt.tight_layout()
+#     return fig, ax_te
+
+
+
+
+
+
+
+from matplotlib.lines import Line2D  # put this near your other imports
+
+def plot_multiscale_surrogates_summary(
+    L_values: np.ndarray,
+    TE_obs: np.ndarray,
+    TE_surr_all: np.ndarray,
+    p_values: np.ndarray,
+    alpha: float = 0.05,
+    xscale_log: bool = False,
+    figsize=(6, 3),
+):
+    """
+    Summarize multiscale TE with surrogate-based significance.
+
+    Plot:
+      - Observed TE(L) as points/line.
+      - For each L, a vertical bar from 5th to 95th percentile of surrogates.
+      - Surrogate mean TE(L) as dashed line.
+      - Significant scales (p < alpha) highlighted.
+
+    Parameters
+    ----------
+    L_values : array-like
+        Scales L (time units), shape (n_L,).
+    TE_obs : array-like
+        Observed TE(L), shape (n_L,).
+    TE_surr_mean : array-like
+        Mean surrogate TE(L), shape (n_L,).
+    TE_surr_std : array-like
+        Std surrogate TE(L), shape (n_L,) (not used directly, kept for compatibility).
+    TE_surr_all : array-like
+        Surrogate TE values, shape (n_L, n_surrogates).
+    p_values : array-like
+        P-values at each scale, shape (n_L,).
+    alpha : float
+        Significance threshold.
+    xscale_log : bool
+        If True, use log scale for the x-axis.
+    """
+
+    L_values = np.asarray(L_values, float)
+    TE_obs = np.asarray(TE_obs, float)
+
+    TE_surr_all = np.asarray(TE_surr_all, float)
+    p_values = np.asarray(p_values, float)
+
+    if TE_surr_all.ndim != 2 or TE_surr_all.shape[0] != L_values.size:
+        raise ValueError(
+            "TE_surr_all must have shape (n_L, n_surrogates) with "
+            "n_L == L_values.size."
+        )
+
+    n_L, n_surr = TE_surr_all.shape
+
+    # Per-scale 5th and 95th percentiles (vertical band at each L)
+    TE_lower = np.full(n_L, np.nan, dtype=float)
+    TE_upper = np.full(n_L, np.nan, dtype=float)
+
+    for i in range(n_L):
+        row = TE_surr_all[i, :]
+        finite = np.isfinite(row)
+        if finite.any():
+            TE_lower[i] = np.percentile(row[finite], 5)
+            TE_upper[i] = np.percentile(row[finite], 95)
+        # else: remain NaN -> no bar at this scale
+
+    fig, ax_te = plt.subplots(1, 1, figsize=figsize)
+
+    # 1) Per-scale vertical 5–95% bars for surrogates
+    band_mask = np.isfinite(TE_lower) & np.isfinite(TE_upper)
+    for L, lo, hi in zip(L_values[band_mask], TE_lower[band_mask], TE_upper[band_mask]):
+        ax_te.vlines(L, lo, hi, color="C0", alpha=0.35, linewidth=20)
+
+    # # 2) Surrogate mean (dashed) where defined
+    # mean_mask = np.isfinite(TE_surr_mean)
+    # if mean_mask.any():
+    #     ax_te.plot(
+    #         L_values[mean_mask],
+    #         TE_surr_mean[mean_mask],
+    #         "C0--",
+    #         linewidth=1,
+    #         label="Surrogate mean",
+    #     )
+
+    # 3) Observed TE curve
+    ax_te.plot(
+        L_values,
+        TE_obs,
+        "o-",
+        color="C3",
+        label="Observed TE",
+    )
+
+    # 4) Highlight significant scales
+    sig_mask = np.isfinite(p_values) & (p_values < alpha) & np.isfinite(TE_obs)
+    if sig_mask.any():
+        ax_te.scatter(
+            L_values[sig_mask],
+            TE_obs[sig_mask],
+            s=60,
+            facecolor="none",
+            edgecolor="k",
+            linewidth=1.5,
+            label=f"p < {alpha:g}",
+            zorder=5,
+        )
+
+    # 5) Cosmetics and legend
+    if xscale_log:
+        ax_te.set_xscale("log")
+
+    ax_te.set_xlabel("Scale L (time units)")
+    ax_te.set_ylabel("TE X → Y (bits)")
+    ax_te.set_title("Multiscale TE with surrogate-based significance")
+    ax_te.grid(True, alpha=0.3)
+
+    # Custom legend entry for the 5–95% bars
+    proxy_band = Line2D(
+        [0], [0],
+        color="C0",
+        linewidth=4,
+        alpha=0.35,
+        label="Surrogate 5–95% range",
+    )
+    handles, labels = ax_te.get_legend_handles_labels()
+    handles.insert(0, proxy_band)
+    labels.insert(0, "Surrogate 5–95% range")
+    ax_te.legend(handles, labels)
+
+    plt.tight_layout()
+    return fig, ax_te
+
+
+
+
+
+
+
+
+def compute_miste_multiscale_with_surrogates(
+    t_x: np.ndarray,
+    x_vals: np.ndarray,
+    t_y: np.ndarray,
+    y_vals: np.ndarray,
+    quantiles: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+    n_surrogates: int = 199,
+    surrogate_mode: str = "shuffle_xpast",
+    random_state: Optional[int] = None,
+    te_method: str = "binned",
+    if_plot_surrogates: bool = False,
+    **single_scale_kwargs,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Multiscale MISTE with surrogate-based significance for a single age model.
+
+    Parameters
+    ----------
+    (t_x, x_vals, t_y, y_vals, quantiles)
+        As in compute_miste_multiscale.
+    n_surrogates : int
+        Number of surrogate realizations per scale.
+    surrogate_mode : str
+        Surrogate construction mode, passed to
+        compute_miste_single_scale_with_surrogates.
+    random_state : int or None
+        Seed for reproducibility.
+    te_method : {"binned", "gaussian"}
+        Which TE estimator to use.
+    single_scale_kwargs :
+        Extra keyword args passed through to
+        compute_miste_single_scale_with_surrogates
+        (e.g., grid_step_factor, min_valid_data_length, te_kwargs).
+
+    Returns
+    -------
+    L_values : np.ndarray
+        Scales L.
+    TE_obs : np.ndarray
+        Observed TE(L) at each scale.
+    TE_surr_mean : np.ndarray
+        Mean surrogate TE(L) at each scale.
+    TE_surr_std : np.ndarray
+        Std surrogate TE(L) at each scale.
+    p_values : np.ndarray
+        p-value for each scale (right-tailed).
+    """
+    t_x = np.asarray(t_x, float)
+    t_y = np.asarray(t_y, float)
+    x_vals = np.asarray(x_vals, float)
+    y_vals = np.asarray(y_vals, float)
+
+    L_values = compute_gap_scales(t_x, t_y, quantiles=quantiles)
+    n_L = L_values.size
+
+    TE_obs = np.full(n_L, np.nan, dtype=float)
+    TE_surr_mean = np.full(n_L, np.nan, dtype=float)
+    TE_surr_std = np.full(n_L, np.nan, dtype=float)
+    p_values = np.full(n_L, np.nan, dtype=float)
+
+    # Use a single RNG and advance it across scales
+    rng = np.random.default_rng(random_state)
+
+
+    # save all TE_surr of all L
+    # Creat a 2D array to hold all surrogate TE values
+    TE_surr_all = np.full((n_L, n_surrogates), np.nan, dtype=float)
+
+    for i, L in enumerate(L_values):
+        # give each scale its own independent seed by drawing from the RNG
+        rs_i = int(rng.integers(0, 2**32 - 1))
+
+        TE_L, TE_surr_L, p_L = compute_miste_single_scale_with_surrogates(
+            t_x,
+            x_vals,
+            t_y,
+            y_vals,
+            L,
+            te_method=te_method,
+            n_surrogates=n_surrogates,
+            surrogate_mode=surrogate_mode,
+            random_state=rs_i,
+            **single_scale_kwargs,
+        )
+
+        TE_obs[i] = TE_L
+        p_values[i] = p_L
+
+        # finite = np.isfinite(TE_surr_L)
+        # if finite.any():
+        #     TE_surr_mean[i] = TE_surr_L[finite].mean()
+        #     TE_surr_std[i] = TE_surr_L[finite].std(ddof=1)
+
+        # not checking finite here, just take mean and std of whatever is there
+        # TE_surr_mean[i] = np.nanmean(TE_surr_L)
+        # TE_surr_std[i] = np.nanstd(TE_surr_L, ddof=1)
+
+        # Store surrogate TE values for this scale
+        TE_surr_all[i, :] = TE_surr_L
+
+    if if_plot_surrogates:
+        plot_multiscale_surrogates_summary(
+            L_values,
+            TE_obs,
+            TE_surr_all,
+            p_values,
+        )
+
+    return L_values, TE_obs, TE_surr_all, p_values
+
+
+
+
+
+
+
+
 
 
 # ------------------------------------------------------------
@@ -888,8 +1500,31 @@ def compute_miste_multiscale_ae(
                 t_x_m, x_vals, t_y_m, y_vals, L, **single_scale_kwargs
             )
 
-    TE_mean = np.nanmean(TE_all, axis=0)
-    TE_std = np.nanstd(TE_all, axis=0, ddof=1)
+    # TE_mean = np.nanmean(TE_all, axis=0)
+    # TE_std = np.nanstd(TE_all, axis=0, ddof=1)
+
+    # return L_values, TE_mean, TE_std, TE_all
+
+    TE_mean = np.full(n_L, np.nan, dtype=float)
+    TE_std = np.full(n_L, np.nan, dtype=float)
+
+    for i in range(n_L):
+        col = TE_all[:, i]
+        finite = np.isfinite(col)
+        n = finite.sum()
+
+        if n == 0:
+            # No ensemble produced a finite TE at this scale -> leave NaN
+            TE_mean[i] = np.nan
+            TE_std[i] = np.nan
+        elif n == 1:
+            # Only one finite value: mean is that value, std not defined
+            TE_mean[i] = col[finite][0]
+            TE_std[i] = np.nan  # or 0.0 if you prefer
+        else:
+            vals = col[finite]
+            TE_mean[i] = vals.mean()
+            TE_std[i] = vals.std(ddof=1)
 
     return L_values, TE_mean, TE_std, TE_all
 
