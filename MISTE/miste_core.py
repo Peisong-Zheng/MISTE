@@ -794,7 +794,7 @@ def compute_miste_single_scale(
     grid_step_factor: float = 0.5,
     window_half_width_factor: float = 0.5,
     sigma_factor: float = 1/3,
-    min_valid_data_length: int = 30,
+    min_valid_data_length: int = 200,
     te_method : {"binned", "gaussian", "pyinform"} = "binned",
     if_plot_alignment: bool = False,
     te_kwargs: Optional[dict] = None,
@@ -1037,7 +1037,7 @@ def compute_miste_single_scale_with_surrogates(
     grid_step_factor: float = 0.5,
     window_half_width_factor: float = 0.5,
     sigma_factor: float = 1/3,
-    min_valid_data_length: int = 30,
+    min_valid_data_length: int = 200,
     te_method: str = "binned",  # "binned" or "gaussian"
     n_surrogates: int = 1000,
     surrogate_mode: str = "shuffle_xpast",  # currently only this mode
